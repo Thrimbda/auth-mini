@@ -55,11 +55,16 @@ jobs:
 
           service_name="auth-mini.service"
           install_path="/usr/local/bin/auth-mini"
+          override_dir="/etc/systemd/system/${service_name}.d"
+          override_path="${override_dir}/validation.conf"
           release_tag="${RELEASE_TAG:-latest}"
           archive_name="auth-mini-linux-x86_64.tar.gz"
-          release_base_url="https://github.com/zccz14/auth-mini/releases/download/${release_tag}"
+          release_base_url="https://github.com/Thrimbda/auth-mini/releases/download/${release_tag}"
           work_dir="$(mktemp -d)"
           backup_path=""
+          override_backup_path=""
+          had_install_path="false"
+          had_override="false"
 
           cleanup() {
             rm -rf "${work_dir}"
@@ -79,9 +84,16 @@ jobs:
           current_sha=""
           if test -x "${install_path}"; then
             current_sha="$(sha256sum "${install_path}" | awk '{print $1}')"
+            had_install_path="true"
           fi
 
-          if test "${new_sha}" = "${current_sha}"; then
+          current_pid="$(systemctl show "${service_name}" --property=MainPID --value)"
+          current_exe=""
+          if test -n "${current_pid}" && test "${current_pid}" != "0"; then
+            current_exe="$(readlink -f "/proc/${current_pid}/exe" || true)"
+          fi
+
+          if test "${new_sha}" = "${current_sha}" && test "${current_exe}" = "${install_path}"; then
             echo "auth-mini is already at ${release_tag}; skipping restart."
             exit 0
           fi
@@ -91,9 +103,20 @@ jobs:
             backup_path="${install_path}.bak.${timestamp}"
             cp "${install_path}" "${backup_path}"
           fi
+          if test -f "${override_path}"; then
+            override_backup_path="${work_dir}/validation.conf.previous"
+            cp "${override_path}" "${override_backup_path}"
+            had_override="true"
+          fi
 
           install -m 0755 auth-mini "${install_path}"
-          systemctl restart "${service_name}"
+          mkdir -p "${override_dir}"
+          cat > "${override_path}" <<OVERRIDE
+          [Service]
+          ExecStart=
+          ExecStart=${install_path} --host 127.0.0.1 --port 7777 --db /var/lib/auth-mini/auth-mini.sqlite
+          OVERRIDE
+          systemctl daemon-reload
 
           wait_for_health() {
             local url="$1"
@@ -116,18 +139,35 @@ jobs:
           }
 
           verify_deployment() {
+            systemctl restart "${service_name}"
             wait_for_health "http://127.0.0.1:7777/openapi.yaml" 30 2
             verify_endpoint "http://127.0.0.1:7777/openapi.json"
             verify_endpoint "http://127.0.0.1:7777/web/"
+            verify_endpoint "https://auth.0xc1.wang/openapi.json"
+
+            local main_pid running_exe running_sha
+            main_pid="$(systemctl show "${service_name}" --property=MainPID --value)"
+            running_exe="$(readlink -f "/proc/${main_pid}/exe")"
+            running_sha="$(sha256sum "/proc/${main_pid}/exe" | awk '{print $1}')"
+            test "${running_exe}" = "${install_path}"
+            test "${running_sha}" = "${new_sha}"
           }
 
           rollback_previous_binary() {
             echo "New auth-mini failed verification; restoring previous binary."
-            if test -n "${backup_path}"; then
+            if test "${had_install_path}" = "true" && test -n "${backup_path}"; then
               install -m 0755 "${backup_path}" "${install_path}"
-              systemctl restart "${service_name}"
-              wait_for_health "http://127.0.0.1:7777/openapi.yaml" 30 2
+            else
+              rm -f "${install_path}"
             fi
+            if test "${had_override}" = "true"; then
+              install -m 0644 "${override_backup_path}" "${override_path}"
+            else
+              rm -f "${override_path}"
+            fi
+            systemctl daemon-reload
+            systemctl restart "${service_name}"
+            wait_for_health "http://127.0.0.1:7777/openapi.yaml" 30 2
             exit 1
           }
 
